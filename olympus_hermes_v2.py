@@ -1,12 +1,14 @@
 import asyncio
-import socket
+#import socket
 import time
 import base64
 import cv2
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket
 from adafruit_servokit import ServoKit
 from picamera2 import Picamera2
-import board
+#import board
+
 
 app = FastAPI()
 kit = ServoKit(channels=16)
@@ -103,19 +105,26 @@ tracker = SmoothTracker()
 # 1. 顔追従UDP受信 & 100Hz駆動ループ
 class VisionProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
-        vals = data.decode().split(',')
-        if len(vals) >= 2:
-            tracker.update_target(float(vals[0]), float(vals[1]))
-
+        try:
+            vals = data.decode().split(',')
+            if len(vals) >= 2:
+                tracker.update_target(float(vals[0]), float(vals[1]))
+        except (ValueError, UnicodeDecodeError) as e:
+            print(f"⚠️ Invalid UDP data: {e}", flush=True)
+            
     def error_received(self, exc):
         print(f"⚠️ UDP error: {exc}", flush=True)
 
+udp_transport = None
+
 async def vision_control_loop():
     
+    global udp_transport
     loop = asyncio.get_event_loop()
     
     # OSに登録するだけ
-    transport, protocol = await loop.create_datagram_endpoint(
+    #transport, protocol = await loop.create_datagram_endpoint(
+    udp_transport, _ = await loop.create_datagram_endpoint(
     VisionProtocol,
     local_addr=("0.0.0.0", 5005)
     )
@@ -144,8 +153,16 @@ async def drive_endpoint(websocket: WebSocket):
     
     try:
         while True:
-            data = await websocket.receive_json()　#JSONデータが来るまで待機。OSが通知するまでCPU不使用
-            thr, brk, back, neut, steer = data['throttle'], data['brake'], data['isBackMode'], data['isNeutral'], data['steer']
+            data = await websocket.receive_json() # JSONデータが来るまで待機。OSが通知するまでCPU不使用
+            try:
+                thr = data['throttle']
+                brk = data['brake']
+                back = data['isBackMode']
+                neut = data['isNeutral']
+                steer = data['steer']
+            except KeyError as e:
+                print(f"Missing key in drive data: {e}")
+                continue
             # ステアリング
             if neut: kit.servo[STR_CH].angle = ANGLE_CENTER
             else:
@@ -181,7 +198,7 @@ async def video_endpoint(websocket: WebSocket):
         return
     try:
         while True:
-            frame = await asyncio.to_thread(picam2.capture_array)　#カメラ完了まで待機。スレッドが動く間CPU不使用
+            frame = await asyncio.to_thread(picam2.capture_array) #カメラ完了まで待機。スレッドが動く間CPU不使用
             #frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             #_, buf = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 50])
             _,buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
@@ -191,10 +208,21 @@ async def video_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"Video WS error: {e}")
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(vision_control_loop())
-    asyncio.create_task(servo_drive_loop())
+`@asynccontextmanager`
+async def lifespan(app: FastAPI):
+    # Startup
+    task1 = asyncio.create_task(vision_control_loop())
+    task2 = asyncio.create_task(servo_drive_loop())
+    yield
+    # Shutdown
+    task1.cancel()
+    task2.cancel()
+    
+app = FastAPI(lifespan=lifespan)
+#@app.on_event("startup")
+#async def startup():
+#    asyncio.create_task(vision_control_loop())
+#    asyncio.create_task(servo_drive_loop())
 
 if __name__ == "__main__":
     import uvicorn
@@ -215,9 +243,13 @@ if __name__ == "__main__":
             task.cancel()
         
         # 2. カメラを確実に止める
-        if 'picam2' in locals() or 'picam2' in globals():
+        #if 'picam2' in locals() or 'picam2' in globals():
+        if picam2 is not None:
             print("📸 カメラを停止中...")
-            picam2.stop()
-            picam2.close()
-            
+            try:
+                picam2.stop()
+                picam2.close()
+            except Exception as e:
+                print(f"カメラ停止エラー: {e}")
+                
         print("✅ プロンプトに戻ります。")
