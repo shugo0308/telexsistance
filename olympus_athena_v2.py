@@ -32,6 +32,7 @@ class AppState:
         self.manual_offset_y = 0.0 
         self.current_distance = 0.0
         self.last_y_out = 0.0
+        self.last_pitch_out = 0.0
         self.is_moving       = False
         
 app.state = AppState()
@@ -41,9 +42,19 @@ class ConnectionManager:
     async def connect(self, ws): await ws.accept(); self.connections.append(ws)
     def disconnect(self, ws): self.connections.remove(ws)
     async def broadcast_json(self, data):
-        for c in self.connections:
-            try: await c.send_json(data)
-            except: pass
+        #for c in self.connections:
+        #    try: await c.send_json(data)
+        #    except: pass
+        stale = []
+        for c in list(self.connections):
+            try:
+                await asyncio.wait_for(c.send_json(data), timeout=0.1)
+            except (WebSocketDisconnect, RuntimeError, asyncio.TimeoutError):
+                stale.append(c)
+        
+        for c in stale:
+            if c in self.connections:
+                self.connections.remove(c)
 
 manager = ConnectionManager()
 
@@ -191,111 +202,134 @@ async def ai_task():
         "-o", "-"
         ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    with mp_face_mesh.FaceMesh(
-        max_num_faces=1, refine_landmarks=True,
-        min_detection_confidence=0.6, min_tracking_confidence=0.6
-    ) as face_mesh:
-        
-        buffer = b""
-        while True:
-            # ✅ ブロッキングI/Oをスレッドに逃がす
-            chunk = await asyncio.to_thread(proc.stdout.read, 4096)
-            #chunk = proc.stdout.read(4096)
-            if not chunk:
-                break
+    try:
+        with mp_face_mesh.FaceMesh(
+            max_num_faces=1, refine_landmarks=True,
+            min_detection_confidence=0.6, min_tracking_confidence=0.6
+        ) as face_mesh:
+            buffer = b""
+            while True:
+                # ✅ ブロッキングI/Oをスレッドに逃がす
+                chunk = await asyncio.to_thread(proc.stdout.read, 4096)
+                #chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
             
-            buffer += chunk
-            a, b = buffer.find(b'\xff\xd8'), buffer.find(b'\xff\xd9')
-            if a == -1 and b == -1:
-                continue
+                buffer += chunk
+                #a, b = buffer.find(b'\xff\xd8'), buffer.find(b'\xff\xd9')
+                #if a == -1 and b == -1:
+                #    continue
             
-            jpg, buffer = buffer[a:b+2], buffer[b+2:]
-            
-            # ✅ 画像デコードをスレッドに逃がす
-            image = await asyncio.to_thread(
-            cv2.imdecode, np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR
-            )
-            if image is None:
-                continue
-            
-            # ✅ 最も重い顔検出処理をスレッドに逃がす
-            #rgb   = await asyncio.to_thread(cv2.cvtColor, image, cv2.COLOR_BGR2RGB)
-            results = await asyncio.to_thread(face_mesh.process) #(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+                #jpg, buffer = buffer[a:b+2], buffer[b+2:]
+                a = buffer.find(b"\xff\xd8")
+                if a == -1:
+                    buffer = b""
+                    continue
                 
-            y_out, r_pitch, out_dist = 0.0, 0.0, 0.0
+                b = buffer.find(b"\xff\xd9", a + 2)
+                if b == -1:
+                    buffer = buffer[a:]
+                    continue
                 
-            if results.multi_face_landmarks:
-                t_start = time.perf_counter() #T1計測開始
-                    
-                print("Face Detected!") # 顔検出デバッグ用
-                    
-                face = results.multi_face_landmarks[0]
-                y, p, r_y, r_p, dist = estimator.get_angles_and_distance(face, app.state.manual_offset_y)
-                    
-                if app.state.mode_request:
-                    if app.state.mode_request == "center":
-                        estimator.set_center(r_y, r_p)
-                    app.state.mode_request = None
-                        
-                # 1. 生の計算値に左右反転を適用
-                raw_target = -y
-                    
-                # 2. デッドゾーン（遊び）の判定
-                # 差分が 0.7度 以下の場合は「微細な震え（ノイズ）」と断定して更新しない
-                if not hasattr(app.state, 'stable_y'):
-                    app.state.stable_y = 0.0
-                    app.state.is_moving = False  # 動いているかどうかのフラグ
-                    
-                diff = abs(raw_target - app.state.stable_y)
-
-                # --- 動的閾値の決定 ---
-                # 移動中は敏感に(0.5度)、静止中は大胆に(2.0度)
-                threshold = 0.5 if app.state.is_moving else 2.0
-
-                if diff > threshold:
-                    # 閾値を超えたら「移動中」とみなし、値を更新
-                    app.state.stable_y = raw_target
-                    app.state.is_moving = True
-                    y_out = raw_target
-                else:
-                    # 閾値以下なら「静止中」とみなし、値を維持
-                    app.state.is_moving = False
-                    y_out = app.state.stable_y
-                    
-                r_pitch, out_dist = p, dist
-                    
-                # --- [追加] 定量的評価用のログ出力 ---
-                # 形式: タイムスタンプ, 計算角度(y), 送信角度(y_out), 推定距離
-                t_now = time.perf_counter()
-                t1_latency = (t_now - t_start) * 1000 # ミリ秒換算
-                #print(f"[DATA_LOG] {time.time():.3f}, raw_y:{y:.2f}, cmd_y:{y_out:.2f}, dist:{dist:.1f}, T1:{t1_latency:.2f}ms")
-                    
-                    
-                # LED自動調光: 距離300mm(0.1暗) 〜 1000mm(0.8明)
-                bright = np.clip((dist - 300) / 700 * 0.7 + 0.1, 0.1, 0.8)
-                pixels.brightness = bright
-                pixels.fill((255, 245, 210)) 
-                pixels.show()
-                    
-                #送信部分
-                #print(f"Sending UDP: {y_out}, {r_pitch}") # 顔検出デバッグ用
-                t1_athena = time.time() #認識完了・送信直前の時刻
-                message = f"{y_out},{r_pitch},{t1_athena}"
-                udp_sock.sendto(message.encode(), (DEST_IP, DEST_PORT))
-
-            # ✅ エンコードもスレッドに逃がす
-            _, buf = await asyncio.to_thread(
-                cv2.imencode, '.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 50]
+                jpg, buffer = buffer[a:b + 2], buffer[b + 2:]
+                # ✅ 画像デコードをスレッドに逃がす
+                image = await asyncio.to_thread(
+                cv2.imdecode, np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR
                 )
-            await manager.broadcast_json({
-                "img": base64.b64encode(buf).decode('utf-8'), 
-                "y": y_out,
-                "p": r_pitch,
-                "dist": out_dist,
-                "server_ts": time.time() * 1000  # T3計測用：サーバー送信時刻(ms)
-                })
-            await asyncio.sleep(0.01)
+                if image is None:
+                    continue
+                        
+                # ✅ 最も重い顔検出処理をスレッドに逃がす
+                #rgb   = await asyncio.to_thread(cv2.cvtColor, image, cv2.COLOR_BGR2RGB)
+                results = await asyncio.to_thread(face_mesh.process) #(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+                #修正箇所
+                y_out = app.state.last_y_out
+                r_pitch = app.state.last_pitch_out
+                out_dist = app.state.current_distance
+                
+                if results.multi_face_landmarks:
+                    t_start = time.perf_counter() #T1計測開始
+                    
+                    print("Face Detected!") # 顔検出デバッグ用
+                    
+                    face = results.multi_face_landmarks[0]
+                    y, p, r_y, r_p, dist = estimator.get_angles_and_distance(face, app.state.manual_offset_y)
+                    
+                    if app.state.mode_request:
+                        if app.state.mode_request == "center":
+                            estimator.set_center(r_y, r_p)
+                        app.state.mode_request = None
+                        
+                    # 1. 生の計算値に左右反転を適用
+                    raw_target = -y
+                    
+                    # 2. デッドゾーン（遊び）の判定
+                    # 差分が 0.7度 以下の場合は「微細な震え（ノイズ）」と断定して更新しない
+                    if not hasattr(app.state, 'stable_y'):
+                        app.state.stable_y = 0.0
+                        app.state.is_moving = False  # 動いているかどうかのフラグ
+                    
+                    diff = abs(raw_target - app.state.stable_y)
+
+                    # --- 動的閾値の決定 ---
+                    # 移動中は敏感に(0.5度)、静止中は大胆に(2.0度)
+                    threshold = 0.5 if app.state.is_moving else 2.0
+
+                    if diff > threshold:
+                        # 閾値を超えたら「移動中」とみなし、値を更新
+                        app.state.stable_y = raw_target
+                        app.state.is_moving = True
+                        y_out = raw_target
+                    else:
+                        # 閾値以下なら「静止中」とみなし、値を維持
+                        app.state.is_moving = False
+                        y_out = app.state.stable_y
+                    
+                    r_pitch, out_dist = p, dist
+                    
+                    # --- [追加] 定量的評価用のログ出力 ---
+                    # 形式: タイムスタンプ, 計算角度(y), 送信角度(y_out), 推定距離
+                    t_now = time.perf_counter()
+                    t1_latency = (t_now - t_start) * 1000 # ミリ秒換算
+                    #print(f"[DATA_LOG] {time.time():.3f}, raw_y:{y:.2f}, cmd_y:{y_out:.2f}, dist:{dist:.1f}, T1:{t1_latency:.2f}ms")
+                    
+                    
+                    # LED自動調光: 距離300mm(0.1暗) 〜 1000mm(0.8明)
+                    bright = np.clip((dist - 300) / 700 * 0.7 + 0.1, 0.1, 0.8)
+                    pixels.brightness = bright
+                    pixels.fill((255, 245, 210)) 
+                    pixels.show()
+                    
+                    #送信部分
+                    #print(f"Sending UDP: {y_out}, {r_pitch}") # 顔検出デバッグ用
+                    t1_athena = time.time() #認識完了・送信直前の時刻
+                    message = f"{y_out},{r_pitch},{t1_athena}"
+                    try:
+                        udp_sock.sendto(message.encode(), (DEST_IP, DEST_PORT))
+                    except Exception as e:
+                        print(f"UDP Send Error: {e}")
+            
+                # ✅ エンコードもスレッドに逃がす
+                _, buf = await asyncio.to_thread(
+                    cv2.imencode, '.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 50]
+                    )
+                await manager.broadcast_json({
+                    "img": base64.b64encode(buf).decode('utf-8'), 
+                    "y": y_out,
+                    "p": r_pitch,
+                    "dist": out_dist,
+                    "server_ts": time.time() * 1000  # T3計測用：サーバー送信時刻(ms)
+                    })
+                await asyncio.sleep(0.01)
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 # ==========================================
 # 🔁 自動再起動ラッパー
@@ -318,3 +352,4 @@ async def startup():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
