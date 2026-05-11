@@ -1,0 +1,490 @@
+﻿<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Athena & Hermes Control Center</title>
+    <style>
+        body {
+            margin: 0;
+            background: #1a1a1a;
+            color: white;
+            font-family: 'Segoe UI', sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        /* 画面中央のメインスクリーン */
+        .screen-container {
+            margin-top: 20px;
+            padding: 15px;
+            background: #2d2d2d;
+            border-radius: 12px;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.7);
+            text-align: center;
+        }
+
+        /* 現在どっちの映像かを表示するラベル */
+        #view_label {
+            margin-bottom: 10px;
+            font-weight: bold;
+            color: #3498db;
+        }
+
+        #main_screen_canvas {
+            max-width: 800px;
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            background: #000;
+            display: block;
+        }
+
+        img {
+            max-width: 800px;
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            background: #000;
+        }
+
+        /* 操作パネル（ボタンを横並びにする） */
+        .controls {
+            margin: 20px;
+            padding: 20px;
+            background: #2d2d2d;
+            border-radius: 12px;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            font-weight: bold;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        /* 接続ボタン */
+        .btn-connect {
+            background: #f1c40f;
+            color: #000;
+        }
+
+        /* アクションボタン */
+        .btn-calib {
+            background: #3498db;
+            color: white;
+        }
+        /* 補正 */
+        .btn-switch {
+            background: #2ecc71;
+            color: white;
+        }
+        /* 画面切替 */
+        .btn-reset {
+            background: #e74c3c;
+            color: white;
+        }
+        /* リセット */
+
+        button:hover {
+            opacity: 0.8;
+            transform: translateY(-2px);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        /* 接続ステータス */
+        .status-bar {
+            color: #aaa;
+            font-size: 13px;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Project OLYMPUS</h1>
+
+    <div class="screen-container">
+        <div id="view_label">Athena: Tracking Mode</div>
+        <canvas id="main_screen_canvas" width="640" height="480"></canvas>
+        <div id="conn_status" class="status-bar">Connection: Connecting...</div>
+    </div>
+
+    <div class="controls">
+        <button class="btn-connect" id="btn_hid">🎮 ハンコン接続</button>
+        <button class="btn-calib" onclick="sendControlRequest('center')">0点補正実行</button>
+        <button class="btn-reset" onclick="sendControlRequest('reset')">オフセット初期化</button>
+        <button class="btn-switch" onclick="toggleView()">映像切り替え (Athena ⇄ Hermes)</button>
+    </div>
+
+    <div id="debugOut" style="font-family: monospace; color: #00ff00; margin: 10px;"></div>
+
+    <div class="screen-container">
+
+        <div id="angle_display" style="font-size: 24px; color: #ffcc00; margin-bottom: 5px; font-weight: bold;">
+            Yaw: 0.0° | Pitch: 0.0°
+        </div>
+    </div>
+
+    <div id="debugOut" style="background: rgba(0,0,0,0.5); color: white; padding: 10px; height: 100px; overflow-y: auto; font-family: monospace;">
+        システムログ待機中...
+    </div>
+
+    <script>
+
+        // --- WebSocket設定 ---
+
+        // 1. 変数宣言（重複がないよう1回だけに絞る）
+        let currentMode = 'athena';// 表示モード管理 (athena または hermes)
+        //const mainScreen = document.getElementById('main_screen'); // IDをメインスクリーンに統一
+
+        // 2. WebSocketのURLを構築（テンプレートリテラルを確実に使用）
+        const host = window.location.host;
+
+        // 全てhost変数を使って動的に生成
+        const athenaUrl = `ws://${host}/ws`;                    // athenaのWS
+        const driveUrl = `ws://${host}/ws/drive`;               // hermesの走行用WS
+        const hermesUrl = `ws://${host}/ws/video`;              // hermesの映像配信用WS
+
+        // --- 変数宣言 ---
+        const viewLabel = document.getElementById('view_label');
+        const connStatus = document.getElementById('conn_status');
+        // 角度表示用の要素を取得
+        const angleDisplay = document.getElementById('angle_display');
+        const debugOut = document.getElementById('debugOut');
+
+        // WebGL用
+        const canvas = document.getElementById('main_screen_canvas');
+        const gl = canvas.getContext('webgl');
+
+        // --- 2. WebGLシェーダー設定 ---
+        const vsSource = `
+                attribute vec2 a_position;
+                attribute vec2 a_texCoord;
+                varying vec2 v_texCoord;
+                void main() {
+                    gl_Position = vec4(a_position, 0, 1);
+                    v_texCoord = a_texCoord;
+                }
+            `;
+
+        // --- 魚眼補正シェーダーの定義 ---
+        const fsSource = `
+                precision mediump float;
+                uniform sampler2D u_image;
+                uniform bool u_enableCorrection;
+                varying vec2 v_texCoord;
+
+                void main() {
+                    if (!u_enableCorrection) {
+                        gl_FragColor = texture2D(u_image, v_texCoord);
+                    } else {
+                        // 中心を0,0にする
+                        vec2 p = v_texCoord - 0.5;
+                        float r = length(p);
+
+                        // 🌟 奥行き感を自然にするための数式
+                        // 強すぎるatanを緩和し、直線性を維持しつつ中心の縮小を防ぐ
+                        float theta = atan(r * 2.0);
+                        float r_corrected = tan(theta * 0.28); // tanを使うことで普通の広角レンズに近い遠近感に
+
+                        // 🌟 視界最大化設定
+                        // 黒い縁が出ないギリギリまでズームを下げます（1.0に近づける）
+                        const float zoom = 0.42;
+
+                        vec2 correctedUV = (p / r) * r_corrected / zoom + 0.5;
+
+                        // 黒枠を消すためのクランプ処理（少しだけ端をリピートさせるか、0.0-1.0内に収める）
+                        if (correctedUV.x < 0.0 || correctedUV.x > 1.0 || correctedUV.y < 0.0 || correctedUV.y > 1.0) {
+                            gl_FragColor = vec4(0, 0, 0, 1);
+                        } else {
+                            gl_FragColor = texture2D(u_image, correctedUV);
+                        }
+                    }
+                }
+            `;
+
+        // WebGL初期化関数（プログラム作成）
+        function createShaderProgram(gl, vs, fs) {
+            const compile = (type, src) => {
+                // 1. 容器（シェーダーオブジェクト）の作成
+                const s = gl.createShader(type);
+                // 2. 容器にソースコード(src)（文字列）を流し込む
+                gl.shaderSource(s, src);
+                // 3. 翻訳（コンパイル）の実行
+                gl.compileShader(s);
+                // 4. エラーチェック
+                // 翻訳が成功したかどうかを確認
+                if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+                    // 失敗した場合、どこが間違っているのか（文法ミスなど）を
+                    // GPUから報告（InfoLog）してもらい、エラーとして表示します
+                    throw new Error(gl.getShaderInfoLog(s));
+                // 5. 完成品の返却
+                // 準備が整ったシェーダー（容器s）を呼び出し元に返します
+                return s;
+            };
+            //プログラムオブジェクトの作成
+            const p = gl.createProgram();
+            //頂点シェダーをプログラムオブジェクトに登録
+            gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+            //フラグメントシェダーをプログラムオブジェクトに登録
+            gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+            //リンク(連結)の実行
+            gl.linkProgram(p);
+            //連結成功の確認
+            if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+                //失敗した場合、エラー内容を投げて処理をストップ
+                throw new Error(gl.getProgramInfoLog(p));
+            //完成したプログラムオブジェクトを返す
+            return p;
+        }
+
+        const program = createShaderProgram(gl, vsSource, fsSource);
+        gl.useProgram(program);
+
+        // 頂点データ設定（四角形）
+        const buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 0, 1, 1, -1, 1, 1, -1, 1, 0, 0, 1, 1, 1, 0]), gl.STATIC_DRAW);
+
+        const pos = gl.getAttribLocation(program, "a_position");
+        gl.enableVertexAttribArray(pos);
+        gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 16, 0);
+
+        const tex = gl.getAttribLocation(program, "a_texCoord");
+        gl.enableVertexAttribArray(tex);
+        gl.vertexAttribPointer(tex, 2, gl.FLOAT, false, 16, 8);
+
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+        // 描画場所（Location）を取得
+        const correctionLocation = gl.getUniformLocation(program, "u_enableCorrection");
+
+        function renderFrame(base64Data, enableCorrection) {
+            const img = new Image();
+            img.onload = () => {
+                gl.bindTexture(gl.TEXTURE_2D, texture);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+
+                // 🌟 ここで補正の ON/OFF を WebGL に伝える
+                gl.uniform1i(correctionLocation, enableCorrection ? 1 : 0);
+
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            };
+            img.src = "data:image/jpeg;base64," + base64Data;
+        }
+
+        const driveWS = new WebSocket(driveUrl);
+        driveWS.onclose = () => {
+            console.warn("Drive WS 切断");
+            connStatus.innerText = "⚠️ Drive接続が切断されました";
+        };
+        driveWS.onerror = (e) => {
+            console.error("Drive WS Error:", e);
+        };
+
+        const athenaWS = new WebSocket(athenaUrl);
+        athenaWS.onclose = () => {
+            connStatus.innerText = "⚠️ Athena接続が切断されました";
+        };
+        athenaWS.onerror = (e) => {
+            console.error("Athena WS Error:", e);
+            connStatus.innerText = "❌ Athena接続エラー";
+        };
+
+        // DOMの読み込みが完了したら実行
+        document.addEventListener('DOMContentLoaded', () => {
+            // 1. 初期表示を確定させる
+            viewLabel.innerText = "Athena: Tracking Mode";
+            viewLabel.style.color = "#3498db";
+            angleDisplay.style.visibility = "visible";
+
+            // 2. もし真っ暗なのが気になるなら、待機中画像を表示させる（任意）
+            // mainScreenElement.src = "loading.gif";
+
+            console.log("System Initialized: Athena Mode");
+        });
+
+        //const hermesWS = new WebSocket(hermesUrl);
+
+        // ✅ hermesWSは toggleView() で初めて接続する遅延接続方式に変更
+        let hermesWS = null;
+
+        function toggleView() {
+            if (currentMode === 'athena') {
+                currentMode = 'hermes';
+                viewLabel.innerText = "Hermes: Navigation Mode";
+                viewLabel.style.color = "#2ecc71";
+                angleDisplay.style.visibility = "hidden";
+                // 初回だけ接続を張る
+                if (!hermesWS || hermesWS.readyState === WebSocket.CLOSED) {
+                    hermesWS = new WebSocket(hermesUrl);
+                    hermesWS.onmessage = hermesOnMessage; // 関数を分離して再利用
+                }
+            } else {
+                currentMode = 'athena';
+                viewLabel.innerText = "Athena: Tracking Mode";
+                viewLabel.style.color = "#3498db";
+                angleDisplay.style.visibility = "visible";
+            }
+            // Canvasを一旦クリア（必要に応じて）
+            gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+
+
+        athenaWS.onmessage = (event) => {
+            if (currentMode !== 'athena') return;
+            try {
+                // 文字列をJSONオブジェクトとして解析する
+                const data = JSON.parse(event.data);
+
+                // 解析したJSONの中から "img" キー（Base64文字列）だけを抽出して表示
+                // 1. 画像の更新
+                if (data.img) {
+                    renderFrame(data.img, false); // 🌟 false: 補正なし
+                    /*mainScreen.src = "data:image/jpeg;base64," + data.img;*/
+                }
+
+                // 2. 角度の更新 (yが左右、pが上下)
+                if (data.y !== undefined && data.p !== undefined) {
+                    // 小数点第1位まで表示
+                    angleDisplay.innerText = `Yaw: ${data.y.toFixed(1)}° | Pitch: ${data.p.toFixed(1)}°`;
+                }
+
+                // アテナモードの時は角度を表示、エルメスモードの時は隠すなどの制御も可能
+                angleDisplay.style.visibility = "visible";
+            } catch (e) {
+                console.error("Athena JSON Parse Error:", e);
+            }
+
+        };
+
+        function hermesOnMessage(event) {
+            if (currentMode !== 'hermes') return;
+            // エルメス側の送信形式に合わせて調整（通常はバイナリか、imgキー付きJSON）
+            try {
+                const data = JSON.parse(event.data);
+                if (data.type == "video" && data.data) {
+                    renderFrame(data.data, true); // 🌟 true: 補正あり
+                    /*mainScreen.src = "data:image/jpeg;base64," + data.data;*/
+                }
+            } catch (e) {
+                // JSONでない（生のバイナリ等の）場合はこちら
+                console.error("Hermes data parse error:", e);
+            }
+
+        };
+
+        document.getElementById('btn_hid').addEventListener('click', async () => {
+            try {
+                // ハンコン取得
+                const devices = await navigator.hid.requestDevice({ filters: [{ vendorId: 0x046d, productId: 0xc298 }] });
+                if (devices.length === 0) return;
+                const device = devices[0];
+                await device.open();
+
+                connStatus.innerText = `Connected: ${device.productName}`;
+
+                device.addEventListener('inputreport', (event) => {
+                    const { data } = event;
+                    const view = new DataView(data.buffer);
+
+                    // ステアリング (14bit) -> 0-255
+                    const steerFull = view.getUint16(0, true);
+                    const steerRaw = Math.min(255, Math.floor((steerFull / 16383) * 255));
+
+                    // ボタン・ペダル
+                    const buttons = view.getUint8(2);
+                    const driveRaw = view.getUint8(4);
+                    const statusFlag = view.getUint8(7);
+
+                    let throttle = 0;
+                    let brake = 0;
+                    if (driveRaw < 0x80) throttle = (0x80 - driveRaw) / 128.0;
+                    else if (driveRaw > 0x80) brake = (driveRaw - 0x80) / 127.0;
+
+                    const payload = {
+                        throttle: parseFloat(throttle.toFixed(2)),
+                        brake: parseFloat(brake.toFixed(2)),
+                        isBackMode: (buttons === 0x02), // △ボタン
+                        isNeutral: (statusFlag === 0x3f),
+                        steer: steerRaw
+                    };
+
+                    // エルメスへ送信
+                    if (driveWS && driveWS.readyState === WebSocket.OPEN) {
+                        driveWS.send(JSON.stringify(payload));
+                    }
+                    debugOut.innerText = `STEER: ${steerRaw} | THR: ${payload.throttle} | BRK: ${payload.brake}`;
+
+                });
+            } catch (err) {
+                console.error(err);
+                connStatus.innerText = "Error: " + err.message;
+            }
+        });
+
+        // --- 機能関数 ---
+
+        // 映像ソースの切り替え
+        /*function toggleView() {
+            if (currentMode === 'athena') {
+                currentMode = 'hermes';
+                viewLabel.innerText = "Hermes: Navigation Mode";
+                viewLabel.style.color = "#2ecc71"; // 緑に変更
+            } else {
+                currentMode = 'athena';
+                viewLabel.innerText = "Athena: Tracking Mode";
+                viewLabel.style.color = "#3498db"; // 青に変更
+            }
+            // 切り替え時に一瞬画面をクリア（残像防止）
+            mainScreen.src = "";
+        }*/
+
+        // コマンド送信（補正など）
+        function sendControlRequest(mode) {
+            if (athenaWS.readyState === WebSocket.OPEN) {
+                athenaWS.send(JSON.stringify({ type: "mode", value: mode }));
+
+                const msg = `補正コマンド [${mode}] を送信しました`
+                console.log(msg);
+
+                const debugElement = document.getElementById("debugOut");
+                if (debugElement) {
+                    // 新しいログを一番上に追加し、古いものも数行残すスタイル
+                    const timestamp = new Date().toLocalTimeString();
+                    debugElement.innerHTML = `[${timestamp}] ${msg}<br>` + debugElement.innerHTML;
+
+                    // ログが長くなりすぎないように制限
+                    const lines = debugElement.innerHTML.split("<br>");
+                    if (lines.length > 10) {
+                        debugElement.innerHTML = lines.slice(0, 10).join("<br>");
+                    }
+                }
+            } else {
+                console.error("Athena WebSocket が接続されていません");
+            }
+        }
+
+        // 接続状態の監視
+        setInterval(() => {
+            const aState = athenaWS.readyState === 1 ? "ON" : "OFF";
+            const hState = hermesWS && hermesWS.readyState === 1 ? "ON" : "OFF";
+            connStatus.innerText = `Network Status | Athena: ${aState} | Hermes: ${hState}`;
+        }, 2000);
+
+    </script>
+</body>
+</html>
